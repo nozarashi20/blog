@@ -18,7 +18,7 @@ TUI provides the text editing through `InputWidget`. A widget renders part of th
 
 `RabbitMqTuiCommand` loads the initial queues, adds the widgets to a `Tui` instance, and calls `run()`. Built-in `TextWidget` instances supply the title and help text. TUI keeps the session open until `stop()` and restores the terminal on exit.
 
-My `QueueFilterWidget` extends `InputWidget`. These consecutive registrations in its constructor connect the built-in editing behavior to the application:
+My `QueueFilterWidget` extends `InputWidget`. Its constructor connects TUI's change and submit events to the application:
 
 ```php
 $this->onChange(function (ChangeEvent $event): void {
@@ -32,7 +32,7 @@ $this->onSubmit(function (): void {
 
 `ChangeEvent` is a TUI event. `$state` holds the queue list, selection, and query. The command supplies two closures: `onFilterChanged` invalidates the overview widget, and `onLeaveFilter` calls `$tui->setFocus($overviewWidget)`.
 
-There is no cursor or Backspace handling here. Those belong to `InputWidget`. My decisions are what the edited value means and where focus goes after submission. This is the kind of application code I had hoped to write.
+`InputWidget` handles cursor movement and Backspace. I decide what the edited value means and where focus goes after submission. This is the kind of application code I had hoped to write.
 
 The command's root input listener runs before the focused widget, so its quit binding needs an exception. While the filter has focus, q and Q must reach the text field. Ctrl-C still quits globally.
 
@@ -53,7 +53,7 @@ tick -> refresh -> state -> invalidate -> render
 
 TUI does not observe arbitrary mutations to application objects. Without that explicit invalidation, the query could change in memory while the screen still showed the old matches. The same rule applies when an HTTP response changes the counters.
 
-The queue list uses a custom widget. TUI's built-in `SelectListWidget` already supports selection and navigation, but its label-and-description layout did not fit the aligned, width-dependent queue columns I wanted. I chose to own that rendering and selection behavior. The filter shows how much less application code is needed when a built-in widget fits.
+The queue list uses a custom widget. TUI's built-in `SelectListWidget` already supports selection and navigation, but its label-and-description layout did not fit the aligned, width-dependent queue columns I wanted. That meant implementing rendering and selection myself. The filter shows how much less application code is needed when a built-in widget fits.
 
 `QueueOverviewWidget` extends `AbstractWidget` and implements `FocusableInterface`, using TUI's focus and keybinding traits. Its Down-key branch in `handleInput()` is short. `$keybindings` is obtained earlier in the method, and `queue_down` maps to `Key::DOWN`:
 
@@ -86,13 +86,13 @@ Here `$state` is the same `QueueViewState` that the filter updates. `$renderer` 
 
 A render returns lines without trailing newlines. `RenderContext` supplies the widget's allocated columns and rows, which can be smaller than the terminal. The renderer keeps the selected row in view and applies TUI's `Style(reverse: true)` to highlight it. Narrow layouts drop fields, eventually leaving queue labels alone. Width calculations use `AnsiUtils::visibleWidth()`, so terminal columns, rather than byte counts, determine alignment.
 
-The rendering code neither fetches queues nor prints them. It describes the visible result of the current state within the available space. TUI handles updating the terminal. That separation becomes useful once a second source of changes starts running.
+The renderer returns lines for the current state and available space. TUI writes them to the terminal. The same rendering code can display changes from keyboard input or an HTTP response.
 
 ## Refresh must return control to the interface
 
-While you edit the filter or move through the list, RabbitMQ keeps working. TUI's `onTick()` callback gives the application repeated opportunities to advance a refresh, including when nobody presses a key.
+While you edit the filter or move through the list, RabbitMQ keeps working. TUI runs an event loop that coordinates keyboard input, scheduled work, and rendering. Its `onTick()` callback gives the application repeated opportunities to advance a refresh, including when nobody presses a key.
 
-A tick is not a background thread. If its callback waits for an HTTP response, input waits too. The callback has to return control when there is no response data to consume.
+A tick is not a background thread. If its callback blocks on an HTTP response, input waits too. The callback has to return control when there is no response data to consume.
 
 `RabbitMqManagementQueueRefresh` represents one paginated refresh from RabbitMQ's Management HTTP API. Its `advance()` method keeps a pending response between calls. During TUI refreshes, `$timeout` defaults to `0.0`, which [Symfony HttpClient supports for non-blocking response monitoring](https://symfony.com/doc/current/http_client.html#dealing-with-network-timeouts).
 
@@ -113,11 +113,11 @@ foreach ($this->httpClient->stream($this->response, $timeout) as $response => $c
 }
 ```
 
-A timeout chunk here means no data is ready on this poll. Returning `null` keeps the refresh pending and lets TUI process input before trying again. The response is decoded only after its final chunk arrives. The `$this->items` callback extracts the page's entries and pagination information. The omitted code accumulates those entries, then either prepares the next page or returns the complete sorted list.
+A timeout chunk here means no data is ready on this poll. Returning `null` keeps the refresh pending and lets TUI process input before trying again. `advance()` decodes the response only after its final chunk arrives. The `$this->items` callback extracts the page's entries and pagination information. The omitted code accumulates those entries, then either prepares the next page or returns the complete sorted list.
 
 Decoding, mapping, sorting, and rendering still execute synchronously. A zero stream timeout does not make every part of the application asynchronous.
 
-Something also needs to decide when requests start and when a completed result replaces the visible data. That is `QueueRefreshController`'s responsibility. It owns one active refresh and publishes completed results into the shared `QueueViewState`.
+`QueueRefreshController` decides when requests start and when completed results replace the visible data. It allows one active refresh at a time and writes completed results to the shared `QueueViewState`.
 
 The following is an overview-only adaptation of the callback in `RabbitMqTuiCommand::__invoke()`. It assumes the controller and both widgets already exist and share that state. The actual callback also advances detail refreshes and handles screen changes:
 
@@ -138,17 +138,17 @@ $tui->onTick(static function () use (
 
 The two return values have different meanings. The controller's `tick()` returns `true` after a completed response or a failure that needs displaying. It does not compare old and new counters. That Boolean tells the command to invalidate the affected widgets.
 
-The callback's return value tells TUI how to poll. In this installed version, `true` requests fast polling, `null` retains fallback idle polling, and `false` means no polling. Returning the controller's Boolean directly would confuse these contracts: `false` could mean that a request is still pending, or that the next request is not due yet.
+The callback's return value tells TUI how to poll. In this installed version, `true` requests fast polling, `null` retains fallback idle polling, and `false` means no polling. The controller returns `false` when a request is still pending or the next request is not due yet. Passing that value directly to TUI would stop polling in both cases.
 
-Returning `false` between requests stopped automatic refreshes during development. While the interface was idle, no later tick checked the deadline. Returning `null` keeps those checks alive. The controller makes the next refresh due two seconds after observed completion or failure, so slow requests extend the interval. Overview requests never overlap.
+Returning `false` between requests stopped automatic refreshes during development. While the interface was idle, no later tick checked the deadline. Returning `null` keeps those checks alive. The controller schedules the next refresh for two seconds after it observes completion or failure, so slow requests extend the interval. Overview requests never overlap.
 
 Failure changes the status without erasing the last valid list. Otherwise a network error would make an unavailable broker look like a broker with no queues.
 
 ## A response must respect input made while it was pending
 
-Once input can continue during a request, replacing the queue list becomes more interesting than assigning an array.
+Before replacing the queue list, the application needs a complete result and the user's current selection.
 
-First, the response is paginated. Publishing the first page immediately would temporarily remove queues from later pages, potentially including the selected queue. The refresh object accumulates pages privately and returns the sorted list only after the last page. Until then, the old complete list remains usable. This is a complete replacement for the interface, not a transactional snapshot of RabbitMQ across separate HTTP requests.
+RabbitMQ returns queues in pages. Publishing the first page immediately would temporarily remove queues from later pages, potentially including the selected queue. The refresh object accumulates pages privately and returns the sorted list only after the last page. Until then, the old complete list remains usable. The interface receives the complete list at once, though RabbitMQ can change between page requests.
 
 Even with a complete result, retaining a row number is wrong. Imagine this sequence:
 
@@ -178,7 +178,7 @@ if ([] === $queues) {
 
 `indexOf()` compares both virtual host and queue name, since the same name can exist in different virtual hosts. It finds B in the new array even if B moved. If the queue vanished, the method keeps a valid remaining position. The rest of the method handles disappearance during inspection and reconciles selection with the active filter.
 
-That timing is the important part. The response supplies new broker data. It must not restore an earlier user selection. Non-blocking input would feel broken if every completed request could undo the last keypress.
+The response supplies new broker data. It must not restore an earlier user selection. Non-blocking input would feel broken if every completed request could undo the last keypress.
 
 ## From the selected queue to its consumers
 
@@ -192,9 +192,9 @@ The detail screen needs data that the overview does not contain. `QueueDetailRef
 
 The attached consumers show their channels, connections, prefetch, and `Ack yes` settings. The unacknowledged count still belongs to the queue. These fields do not establish which consumer holds a particular delivery or whether a worker is healthy, but they give the count useful context.
 
-Overview refresh continues while detail is open. That costs requests for a hidden screen, but keeps the list current and detects a queue disappearing. A temporary detail failure preserves its last valid snapshot. A 404 instead removes the missing queue from current state and returns to the overview with a notice.
+Overview refresh continues while detail is open. That costs requests for a hidden screen, but keeps the list current and detects a queue disappearing. A temporary detail failure leaves the last valid snapshot visible. If the detail request returns a 404, the application removes the missing queue from current state and returns to the overview with a notice.
 
-The detail widget uses its allocated dimensions too. A short layout omits secondary fields and leaves space below the summary for consumers. Up and Down move a widget-local `consumerOffset` by one entry and invalidate the output. The fixed summary still needs room: at very small heights, no consumer entry fits.
+The detail widget uses its allocated dimensions too. A short layout omits secondary fields and leaves space below the summary for consumers. Up and Down move a widget-local `consumerOffset` by one entry and invalidate the output. If the summary fills the allocated height, no consumer entry fits.
 
 Escape cancels pending detail work and rebuilds the overview. The new filter widget reads the saved query. The list uses its latest snapshot and keeps the queue selected if it still exists. The consumer offset belongs to the discarded detail widget, so it starts over when detail opens again. State for one screen can have a shorter lifetime than state for the ongoing inspection.
 
@@ -202,6 +202,6 @@ Escape cancels pending detail work and rebuilds the overview. The new filter wid
 
 I started wondering how much terminal code I would have to write. The filter answered that quickly. The harder question turned out to be what a refresh was allowed to change while I was using the interface.
 
-TUI made it practical to work on that question in PHP. Once input and redraws were handled, I could spend my attention on whether the application respected what I had just done. Making a screen update was satisfying. Making the update leave me on the queue I was inspecting was what made the experiment feel like an application.
+With TUI handling input and redraws, I could focus on whether the application respected what I had just done. Seeing the counters update was satisfying. Being able to keep inspecting the same queue as they changed made the experiment feel like an application.
 
 The [rabbitmq-tui repository](https://github.com/nozarashi20/rabbitmq-tui) explains how to run the demo.
