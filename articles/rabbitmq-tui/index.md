@@ -4,6 +4,8 @@ Symfony TUI caught my attention during [Fabien Potencier's SymfonyLive Paris tal
 
 I built a small RabbitMQ queue inspector. You can move between queues while their counts update, type a filter, and open the selected queue's detail. The interesting part is being able to keep doing those things while an HTTP request is pending.
 
+![Animated walkthrough of the RabbitMQ queue inspector: live counts, filtering, and queue details.](./rabbitmq-tui-demo.gif)
+
 ![Queue overview with demo.jobs.live selected, showing ready messages, unacknowledged messages, and consumer counts.](./queue-overview.png)
 
 The demo has a publisher and consumers working on `demo.jobs.live`. *Ready* messages await delivery. *Unacknowledged* messages have been delivered but still await acknowledgement. The overview lets us watch those counts, then choose a queue to inspect more closely.
