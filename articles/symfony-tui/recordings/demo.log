@@ -1,0 +1,3 @@
+[2026-10-19T10:00:00.000000+02:00] app.INFO: Application started. [] []
+[2026-10-19T10:00:05.000000+02:00] doctrine.WARNING: Slow query. [] []
+[2026-10-19T10:00:07.000000+02:00] app.ERROR: Payment failed. [] []
